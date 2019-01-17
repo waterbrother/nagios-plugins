@@ -1,0 +1,156 @@
+#!/usr/bin/ruby
+
+require 'optparse'
+
+################################################################################
+# DEFINITIONS
+################################################################################
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+io_device_mib = ".1.3.6.1.4.1.2021.13.15.1"
+one_min_LA = ".1.3.6.1.4.1.2021.13.15.1.1.9"
+five_min_LA = ".1.3.6.1.4.1.2021.13.15.1.1.10"
+fifteen_min_LA = ".1.3.6.1.4.1.2021.13.15.1.1.11"
+
+################################################################################
+# OPTION PARSING
+################################################################################
+options = Hash.new
+options[:host] = nil
+options[:snmpuser] = nil
+options[:authpass] = nil
+options[:privpass] = nil
+options[:authcrypt] = nil
+options[:privcrypt] = nil
+options[:warnlevel] = nil
+options[:critlevel] = nil
+
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: "
+
+	opts.on("-H", "--host HOST", "specify the host to monitor") do |v|
+		options[:host] = v
+	end
+
+	opts.on("-u", "--user USER", "specify the SNMP user") do |v|
+		options[:snmpuser] = v
+	end
+
+	opts.on("-A", "--authpass PASSWD", "specify the authetication password") do |v|
+		options[:authpass] = v
+	end
+
+	opts.on("-X", "--privpass PASSWD", "specify the encryption password") do |v|
+		options[:privpass] = v
+	end
+
+	opts.on("-a", "--authcrypt ALGORITHM", "specify the authpass encryption algorithm") do |v|
+		options[:authcrypt] = v
+	end
+
+	opts.on("-x", "--privcrypt ALGORITHM", "specify the privpass encryption algorithm") do |v|
+		options[:privcrypt] = v
+	end
+
+	opts.on("-w", "--warnlevel n1,n2,n3", "1,5,15 min thresholds of disk load to trigger a warning state") do |v|
+		options[:warnlevel] = v
+	end
+
+	opts.on("-c", "--critlevel n1,n2,n3", "1,5,15 min thresholds of disk load to trigger a critical state") do |v|
+		options[:critlevel] = v
+	end
+
+	opts.on_tail("-h", "--help", "Print usage information") do
+		puts opts
+		exit
+	end
+end.parse!
+
+#verify all options have been set
+empty_opts = Array.new
+options.each_pair do |k,v|
+	if v == nil
+		empty_opts << k.to_s
+	end
+end
+
+if empty_opts.length > 0
+	puts "ERROR - parameters #{empty_opts.join(', ')} are not set"
+	exit UNKNOWN
+end
+
+#get threshold arrays from parsed options
+crit_level=options[:critlevel].split(',')
+warn_level=options[:warnlevel].split(',')
+
+################################################################################
+# LOGIC
+################################################################################
+#check first here that we can read the disk IO via SNMP before continuing
+uptime = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} hrSystemUptime.0 2>/dev/null`
+#puts uptime
+if uptime.length == 0
+	puts "UNKNOWN - could not get a response from SNMP"
+	exit UNKNOWN
+end
+
+#find the SCSI devices
+io_devs = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{io_device_mib} | grep -i diskIODevice | grep sd`
+
+
+#create a hash to associate scsi disks with SNMP indices
+dev_hash = Hash.new
+io_devs.each do |line|
+	dev_name = line.split(' ')[-1]
+	dev_index = line.split(' ')[0].split('.')[1]
+	#puts "device name: #{dev_name}\tdevice index: #{dev_index}"
+	dev_hash[dev_name.to_sym] = dev_index
+end
+
+#iterate over devices and get IO load for each, saving them in in a new hash
+load_avgs = Hash.new
+dev_hash.each_pair do |k,v|
+	loads = Array.new
+	loads << `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{one_min_LA}.#{v}`.split(' ')[-1].to_f
+	loads << `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{five_min_LA}.#{v}`.split(' ')[-1].to_f
+	loads <<  `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{fifteen_min_LA}.#{v}`.split(' ')[-1].to_f
+	load_avgs[k] = loads
+end
+
+
+#iterate over devices and their respective loads;  add device to array if any load is over the threshold
+failures = Array.new
+exit_status = OK
+load_avgs.each_pair do |dev,loadArray|
+	if loadArray[0] >= crit_level[0].to_f or loadArray[1] >= crit_level[1].to_f or loadArray[2] >= crit_level[2].to_f
+		failures << "#{dev.to_s}:#{loadArray.join(',')}"
+		exit_status = CRITICAL
+	elsif loadArray[0] >= warn_level[0].to_f or loadArray[1] >= warn_level[1].to_f or loadArray[2] >= warn_level[2].to_f
+		failures << "#{dev.to_s}:#{loadArray.join(',')}"
+		#failures << dev.to_s
+		exit_status = WARNING
+	end
+end
+
+#print output
+if exit_status == 2
+	puts "CRITICAL - Load Average too high on disk(s) #{failures.join('; ')}"
+elsif exit_status == 1
+	puts "WARNING - Load Average too high on disk(s) #{failures.join('; ')}"
+else
+	puts "OK - Load Average is acceptable on all disks"
+end
+#perf data strings
+#io_perf_data= Array.new
+puts "|"
+load_avgs.each_pair do |dev,loadArray|
+	puts "#{dev.to_s}=#{loadArray[0]};#{loadArray[1]};#{loadArray[2]}"
+end
+
+
+exit exit_status
+

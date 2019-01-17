@@ -1,0 +1,170 @@
+#!/usr/bin/ruby
+
+require 'optparse'
+
+################################################################################
+# DEFINITIONS
+################################################################################
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+PROC_PATHS_OID = ".1.3.6.1.2.1.25.4.2.1.4"
+PROC_PIDS_OID = ".1.3.6.1.2.1.25.4.2.1.1"
+PROC_PARAMS_OID = ".1.3.6.1.2.1.25.4.2.1.5"
+
+################################################################################
+# OPTION PARSING
+################################################################################
+options = Hash.new
+options[:host] = nil
+options[:snmpuser] = nil
+options[:authpass] = nil
+options[:privpass] = nil
+options[:authcrypt] = nil
+options[:privcrypt] = nil
+options[:process] = nil
+options[:debug] = false
+
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: "
+
+	opts.on("-H", "--host HOST", "the host to monitor") do |v|
+		options[:host] = v
+	end
+
+	opts.on("-u", "--user USER", "the SNMP user") do |v|
+		options[:snmpuser] = v
+	end
+
+	opts.on("-A", "--authpass PASSWD", "the authetication password") do |v|
+		options[:authpass] = v
+	end
+
+	opts.on("-X", "--privpass PASSWD", "the encryption password") do |v|
+		options[:privpass] = v
+	end
+
+	opts.on("-a", "--authcrypt ALGORITHM", "the authpass encryption algorithm") do |v|
+		options[:authcrypt] = v
+	end
+
+	opts.on("-x", "--privcrypt ALGORITHM", "the privpass encryption algorithm") do |v|
+		options[:privcrypt] = v
+	end
+
+	opts.on("-p", "--process PROCESS", "a string to parse for in the list of system process") do |v|
+		options[:process] = v
+	end
+
+	opts.on("-d", "--debug", "toggle debug output") do
+		options[:debug] = true
+	end
+
+	opts.on_tail("-h", "--help", "Print usage information") do
+		puts opts
+		exit
+	end
+end.parse!
+
+#verify all options have been set
+empty_opts = Array.new
+options.each_pair do |k,v|
+        if v == nil
+                empty_opts << k.to_s
+        end
+end
+
+if empty_opts.length > 0
+        puts "ERROR - parameters #{empty_opts.join(', ')} are not set"
+        exit UNKNOWN
+end
+
+if options[:debug] == true
+	puts "process: #{options[:process]}"
+end
+
+
+################################################################################
+# LOGIC
+################################################################################
+#check first here that we can read info via SNMP before continuing
+uptime = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} hrSystemUptime.0 2>/dev/null`
+
+if options[:debug] == true
+	puts "SNMP uptime response: #{uptime}"
+end
+
+if uptime.length == 0 or uptime =~ /Timeout/
+	puts "UNKNOWN - could not get a response from SNMP"
+	exit UNKNOWN
+end
+
+#get the full path of all processes, pids, and params
+#important to do this as fas as possible to minimize changes in output
+proc_pids = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{PROC_PIDS_OID} 2>/dev/null`
+
+if options[:debug] == true
+  puts "SNMP Process IDs:"
+  puts proc_pids
+end
+
+proc_paths = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{PROC_PATHS_OID} 2>/dev/null`
+
+if options[:debug] == true
+  puts "SNMP Process paths:"
+  puts proc_paths
+end
+
+proc_params = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{PROC_PARAMS_OID} 2>/dev/null`
+
+if options[:debug] == true
+  puts "SNMP Process parameters:"
+  puts proc_params
+end
+
+
+#build an array of process strings
+procs_array = Array.new
+proc_pids.lines.count.times do |n|
+  proc_pid = proc_pids.split(/\n/)[n].split[3]
+  puts proc_pid if options[:debug] == true
+
+  proc_path = proc_paths.split(/\n/)[n].split[3].delete('"')
+  puts proc_path if options[:debug] == true
+
+  proc_param = proc_params.split(/\n/)[n].split[3..-1].join(' ')
+  proc_param.delete!('"') if proc_param != nil
+  puts proc_param if options[:debug] == true
+
+  procs_array << "#{proc_pid} #{proc_path} #{proc_param}"
+end
+
+if options[:debug] == true
+  puts "all process strings and PIDs:"
+  procs_array.each do |s|
+    puts s
+  end
+end
+
+proc_exists = false
+proc_pid = nil
+procs_array.each do |s|
+  if s =~ /#{options[:process]}/
+    proc_exists = true
+    proc_pid = s.split[0]
+    break
+  end
+end
+
+#print output and exit with rc
+if proc_exists == false
+  puts "CRITICAL - process #{options[:process]} not found | pid=0"
+  exit CRITICAL
+else
+  puts "OK - process #{options[:process]} has pid #{proc_pid}| pid=#{proc_pid}"
+  exit OK
+end
+

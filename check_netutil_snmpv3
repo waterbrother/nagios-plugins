@@ -1,0 +1,255 @@
+#!/usr/bin/ruby
+
+require 'optparse'
+
+################################################################################
+# DEFINITIONS
+################################################################################
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+if_device_mib = ".1.3.6.1.2.1.2.2.1.2"
+if_speed_mib = ".1.3.6.1.2.1.2.2.1.5"
+if_in_mib = ".1.3.6.1.2.1.2.2.1.10"
+if_out_mib = ".1.3.6.1.2.1.2.2.1.16"
+
+def read_file( file )
+	#SLURP
+	f = File.read(file)
+	return f.split(',')	
+end
+
+def write_file( file, oct_in, oct_out, epoch )
+	File.open(file, 'w') { |f| f.write("#{oct_in},#{oct_out},#{epoch}") }
+end
+
+################################################################################
+# OPTION PARSING
+################################################################################
+options = Hash.new
+options[:host] = nil
+options[:device] = nil
+options[:snmpuser] = nil
+options[:authpass] = nil
+options[:privpass] = nil
+options[:authcrypt] = nil
+options[:privcrypt] = nil
+options[:warnlevel] = nil
+options[:critlevel] = nil
+options[:debug] = false
+
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: "
+
+	opts.on("-H", "--host HOST", "the host to monitor") do |v|
+		options[:host] = v
+	end
+
+	opts.on("-D", "--device DEVICE", "the ethernet device to monitor") do |v|
+		options[:device] = v
+	end
+
+	opts.on("-u", "--user USER", "the SNMP user") do |v|
+		options[:snmpuser] = v
+	end
+
+	opts.on("-A", "--authpass PASSWD", "the authetication password") do |v|
+		options[:authpass] = v
+	end
+
+	opts.on("-X", "--privpass PASSWD", "the encryption password") do |v|
+		options[:privpass] = v
+	end
+
+	opts.on("-a", "--authcrypt ALGORITHM", "the authpass encryption algorithm") do |v|
+		options[:authcrypt] = v
+	end
+
+	opts.on("-x", "--privcrypt ALGORITHM", "the privpass encryption algorithm") do |v|
+		options[:privcrypt] = v
+	end
+
+	opts.on("-w", "--warnlevel INT", "threshold percent of network utilization to trigger warning status") do |v|
+		options[:warnlevel] = v
+	end
+
+	opts.on("-c", "--critlevel INT", "threshold percent of network utilization to trigger critical status") do |v|
+		options[:critlevel] = v
+	end
+
+	opts.on("-d", "--debug", "toggle debug output") do
+		options[:debug] = true
+	end
+
+	opts.on_tail("-h", "--help", "Print usage information") do
+		puts opts
+		exit
+	end
+end.parse!
+
+#verify all options have been set
+empty_opts = Array.new
+options.each_pair do |k,v|
+        if v == nil
+                empty_opts << k.to_s
+        end
+end
+
+if empty_opts.length > 0
+        puts "ERROR - parameters #{empty_opts.join(', ')} are not set"
+        exit UNKNOWN
+end
+
+################################################################################
+# LOGIC
+################################################################################
+#set tmpfile path
+tmpfile = "/var/tmp/#{options[:host]}.netutil"
+
+#get time as unix epoch
+epoch = Time.now.to_i
+
+if options[:debug] == true
+	puts "now_epoch: #{epoch}"
+end
+
+#check first here that we can read info via SNMP before continuing
+uptime = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} hrSystemUptime.0 2>/dev/null`
+
+if options[:debug] == true
+	puts "SNMP uptime response: #{uptime}"
+end
+
+if uptime.length == 0
+	puts "UNKNOWN - could not get a response from SNMP"
+	exit UNKNOWN
+end
+
+#find the interface devices
+if_dev = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{if_device_mib} | grep -i #{options[:device]}`
+
+if if_dev.length == 0
+	puts "UNKNOWN - could not find the device #{options[:device]} in SNMP output"
+	exit UNKNOWN
+end
+
+#map interface device to index number
+if_dev_index=if_dev.split(' ')[0].split('.')[1]
+
+#get interface speed
+#note from NET-SNMP docs: 
+#http://www.net-snmp.org/docs/mibs/interfaces.html
+#If thebandwidth of the interface is greater than the maximum value
+#reportable by this object then this object should report its
+#maximum value (4,294,967,295) and ifHighSpeed must be used
+#to report the interace's speed.
+#
+#But ifHighSpeed is not available in this MIB, so we're out of luck! HOWEVER,
+#the IN and OUT counters reset at this value too, so it's as good as we're 
+#going to get for a baseline.
+if_dev_speed = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{if_speed_mib}.#{if_dev_index}`.split(' ')[-1].to_f
+
+if options[:debug] == true
+	puts "speed: #{if_dev_speed}"
+end
+
+#get interface incoming octets
+if_oct_in_1 = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{if_in_mib}.#{if_dev_index}`.split(' ')[-1].to_f
+
+if options[:debug] == true
+	puts "if_in_1: #{if_oct_in_1}"
+end
+#get interface outgoing octets
+if_oct_out_1 =`snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{if_out_mib}.#{if_dev_index}`.split(' ')[-1].to_f
+
+if options[:debug] == true
+	puts "if_out_1: #{if_oct_out_1}"
+end
+
+#determine if tmp file exists, is readable, and is writeable. if it doesn't exist,
+#write stats and exit ok as first run, otherwise process stats.
+if File.exist?( tmpfile ) == false
+	puts "OK - first time script has run, writing stats to #{tmpfile} | ntwk_in_util_pct=0 ntwk_out_util_pct=0"
+	write_file( tmpfile, if_oct_in_1, if_oct_out_1, epoch )
+	exit OK
+elsif File.readable?( tmpfile ) == false
+	puts "UNKNOWN - cannot read tmp file #{tmpfile} | ntwk_in_util_pct=0 ntwk_out_util_pct=0"
+	exit UNKNOWN
+elsif File.writable?( tmpfile ) == false
+	puts "UNKNOWN - cannot write tmp file #{tmpfile} | ntwk_in_util_pct=0 ntwk_out_util_pct=0"
+	exit UNKNOWN
+end
+
+#get if_oct_in, if_oct_out, epoch from last poll cycle
+if_oct_in_2, if_oct_out_2, last_epoch = read_file( tmpfile )
+
+#sset the time delta with our values
+delta = epoch - last_epoch.to_i
+
+if options[:debug] == true
+	puts "last_epoch: #{last_epoch}"
+	puts "if_oct_in_2: #{if_oct_in_2}"
+	puts "if_oct_out_2: #{if_oct_out_2}"
+	puts "time delta: #{delta}"
+end
+
+#########
+# MATH! #
+#########
+# these counters also reset at the max value: 4294967295
+# this means the counter can reset between polling sessions,
+# thus it is important to poll frequently! otherwise, the delta will 
+# be negative, causing a negative percentage to sho. assuming the poll
+# interval is frequent enough to get reset only once between polls, 
+# we can deduce the number of bytes with some arithematic. 
+
+#init the deltas
+if_in_delta = nil
+if_out_delta = nil
+
+# determine IN OCTETS
+if if_oct_in_1 < if_oct_in_2.to_f
+	if_in_delta = ( 4294967295 - if_oct_in_2.to_f ) + if_oct_in_1
+else
+	if_in_delta = if_oct_in_1 - if_oct_in_2.to_f
+end
+
+#determine OUT OCTETS
+if if_oct_out_1 < if_oct_out_2.to_f
+	if_out_delta = ( 4294967295 - if_oct_out_2.to_f ) + if_oct_out_1
+else
+	if_out_delta = if_oct_out_1 - if_oct_out_2.to_f
+end	
+	
+if options[:debug] == true
+	puts "if in delta: #{if_in_delta}"
+	puts "if out delta: #{if_out_delta}"
+end
+
+#use all the above numbers in the below formula to get the percent of bandwidth untilized
+util_in = ( if_in_delta * 8 * 100 ) / ( delta * if_dev_speed )
+util_out = ( if_out_delta * 8 * 100 ) / ( delta * if_dev_speed )
+
+if options[:debug] == true
+	puts "util in: #{util_in}%"
+	puts "util out: #{util_out}%"
+end
+
+#write current statistics to the temp file
+write_file( tmpfile, if_oct_in_1, if_oct_out_1, epoch )
+
+#print output and exit with rc
+if util_out >=  options[:critlevel].to_i or util_in >= options[:critlevel].to_i
+	puts "CRITICAL - network utilization of device #{options[:device]} - incoming: #{util_in}% outgoing: #{util_out}% | ntwk_in_util_pct=#{util_in} ntwk_out_util_pct=#{util_out}"
+	exit CRITICAL
+elsif util_out >=  options[:warnlevel].to_i or util_in >= options[:warnlevel].to_i
+	puts "WARNING - network utilization of device #{options[:device]} - incoming: #{util_in}% outgoing: #{util_out}% | ntwk_in_util_pct=#{util_in} ntwk_out_util_pct=#{util_out}"
+	exit WARNING
+else
+	puts "OK - network utilization of device #{options[:device]} - incoming: #{util_in}% outgoing: #{util_out}% | ntwk_in_util_pct=#{util_in} ntwk_out_util_pct=#{util_out}"
+	exit OK
+end
+

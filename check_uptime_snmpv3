@@ -1,0 +1,130 @@
+#!/usr/bin/ruby
+
+require 'optparse'
+
+################################################################################
+# DEFINITIONS
+################################################################################
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+################################################################################
+# OPTION PARSING
+################################################################################
+options = Hash.new
+options[:host] = nil
+options[:snmpuser] = nil
+options[:authpass] = nil
+options[:privpass] = nil
+options[:authcrypt] = nil
+options[:privcrypt] = nil
+options[:warnlevel] = nil
+options[:critlevel] = nil
+options[:debug] = false
+
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: "
+
+	opts.on("-H", "--host HOST", "the host to monitor") do |v|
+		options[:host] = v
+	end
+
+	opts.on("-u", "--user USER", "the SNMP user") do |v|
+		options[:snmpuser] = v
+	end
+
+	opts.on("-A", "--authpass PASSWD", "the authetication password") do |v|
+		options[:authpass] = v
+	end
+
+	opts.on("-X", "--privpass PASSWD", "the encryption password") do |v|
+		options[:privpass] = v
+	end
+
+	opts.on("-a", "--authcrypt ALGORITHM", "the authpass encryption algorithm") do |v|
+		options[:authcrypt] = v
+	end
+
+	opts.on("-x", "--privcrypt ALGORITHM", "the privpass encryption algorithm") do |v|
+		options[:privcrypt] = v
+	end
+
+	opts.on("-w", "--warnlevel INT", "if uptime is less than this value (in minutes), check will trigger warning status") do |v|
+		options[:warnlevel] = v
+	end
+
+	opts.on("-c", "--critlevel INT", "if uptime is less than this value (in minutes), check will trigger critical status") do |v|
+		options[:critlevel] = v
+	end
+
+	opts.on("-d", "--debug", "toggle debug output") do
+		options[:debug] = true
+	end
+
+	opts.on_tail("-h", "--help", "Print usage information") do
+		puts opts
+		exit
+	end
+end.parse!
+
+#verify all options have been set
+empty_opts = Array.new
+options.each_pair do |k,v|
+        if v == nil
+                empty_opts << k.to_s
+        end
+end
+
+if empty_opts.length > 0
+        puts "ERROR - parameters #{empty_opts.join(', ')} are not set"
+        exit UNKNOWN
+end
+
+#multiply by 60 to turn minutes into seconds,
+#multiply by 100 because snmp reports timeticks in hundreths of a second
+warn_level = options[:warnlevel].to_i * 60 * 100
+crit_level = options[:critlevel].to_i * 60 * 100
+
+if options[:debug] == true
+	puts "warning level: #{warn_level}"
+	puts "critical level: #{crit_level}"
+end
+
+
+################################################################################
+# LOGIC
+################################################################################
+#check first here that we can read info via SNMP before continuing
+uptime = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} hrSystemUptime.0 2>/dev/null`
+
+if options[:debug] == true
+	puts "SNMP uptime response: #{uptime}"
+end
+
+if uptime.length == 0 or uptime =~ /Timeout/
+	puts "UNKNOWN - could not get a response from SNMP"
+	exit UNKNOWN
+end
+
+#parse the response for timeticks
+uptime_ticks = uptime.split(/\s/)[3].gsub( /[()]/,'' ).to_i
+
+if options[:debug] == true
+  puts "SNMP Timeticks: #{uptime_ticks}"
+end
+
+#print output and exit with rc
+if uptime_ticks <= crit_level
+  puts "CRITICAL - System Uptime is less than #{options[:critlevel]} minutes | timeticks=#{uptime_ticks}"
+  exit CRITICAL
+elsif uptime_ticks <= warn_level
+  puts "WARNING - System Uptime is less than #{options[:warnlevel]} minutes | timeticks=#{uptime_ticks}"
+  exit WARNING
+else
+  puts "OK - System Uptime is normal | timeticks=#{uptime_ticks}"
+  exit OK
+end
+

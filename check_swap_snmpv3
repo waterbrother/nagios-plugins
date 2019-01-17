@@ -1,0 +1,143 @@
+#!/usr/bin/ruby
+
+require 'optparse'
+
+################################################################################
+# DEFINITIONS
+################################################################################
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+total_swap_oid = ".1.3.6.1.4.1.2021.4.3.0"
+avail_swap_oid = ".1.3.6.1.4.1.2021.4.4.0"
+
+################################################################################
+# OPTION PARSING
+################################################################################
+options = Hash.new
+options[:host] = nil
+options[:snmpuser] = nil
+options[:authpass] = nil
+options[:privpass] = nil
+options[:authcrypt] = nil
+options[:privcrypt] = nil
+options[:warnlevel] = nil
+options[:critlevel] = nil
+options[:debug] = false
+
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: "
+
+	opts.on("-H", "--host HOST", "the host to monitor") do |v|
+		options[:host] = v
+	end
+
+	opts.on("-u", "--user USER", "the SNMP user") do |v|
+		options[:snmpuser] = v
+	end
+
+	opts.on("-A", "--authpass PASSWD", "the authetication password") do |v|
+		options[:authpass] = v
+	end
+
+	opts.on("-X", "--privpass PASSWD", "the encryption password") do |v|
+		options[:privpass] = v
+	end
+
+	opts.on("-a", "--authcrypt ALGORITHM", "the authpass encryption algorithm") do |v|
+		options[:authcrypt] = v
+	end
+
+	opts.on("-x", "--privcrypt ALGORITHM", "the privpass encryption algorithm") do |v|
+		options[:privcrypt] = v
+	end
+
+	opts.on("-w", "--warnlevel INT", "threshold of CPU load (1,5,15 min load avg.) to trigger warning status") do |v|
+		options[:warnlevel] = v.to_f
+	end
+
+	opts.on("-c", "--critlevel INT", "threshold of CPU load (1,5,15 min load avg.) to trigger critical status") do |v|
+		options[:critlevel] = v.to_f
+	end
+
+	opts.on("-d", "--debug", "toggle debug output") do
+		options[:debug] = true
+	end
+
+	opts.on_tail("-h", "--help", "Print usage information") do
+		puts opts
+		exit
+	end
+end.parse!
+
+#verify all options have been set
+empty_opts = Array.new
+options.each_pair do |k,v|
+        if v == nil
+                empty_opts << k.to_s
+        end
+end
+
+if empty_opts.length > 0
+        puts "ERROR - parameters #{empty_opts.join(', ')} are not set"
+        exit UNKNOWN
+end
+
+################################################################################
+# LOGIC
+################################################################################
+#check first here that we can read info via SNMP before continuing
+uptime = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} hrSystemUptime.0 2>/dev/null`
+
+if options[:debug] == true
+	puts "SNMP uptime response: #{uptime}"
+end
+
+if uptime.length == 0
+	puts "UNKNOWN - could not get a response from SNMP"
+	exit UNKNOWN
+end
+
+#get the total amount of swap space
+total_swap = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{total_swap_oid}`.split(':')[-1].to_i
+
+if options[:debug] == true
+	puts "total swap : #{total_swap} kB"
+end
+
+#get the amount of swap left available
+avail_swap = `snmpwalk -v 3 -u #{options[:snmpuser]} -a #{options[:authcrypt]} -A #{options[:authpass]} -l authPriv -x #{options[:privcrypt]} -X #{options[:privpass]} #{options[:host]} #{avail_swap_oid}`.split(':')[-1].to_i
+
+if options[:debug] == true
+	puts "swap available: #{avail_swap} kB"
+end
+
+#subtract to get the amount of swap used
+used_swap = total_swap - avail_swap
+
+if options[:debug] == true
+	puts "swap used: #{used_swap} kB"
+end
+
+#divide to get percentage used
+pct_used = ( used_swap.to_f / total_swap.to_f ) * 100
+
+if options[:debug] == true
+	puts "percent swap used: #{pct_used}%"
+end
+
+#print output and exit with rc
+if pct_used >= options[:critlevel].to_i
+	puts "CRITICAL - #{pct_used}% swap used (#{used_swap} kB out of #{total_swap} kB) | pct=#{pct_used} used=#{used_swap} total=#{total_swap}"
+	exit CRITICAL
+elsif pct_used >= options[:warnlevel].to_i
+	puts "WARNING - #{pct_used}% swap used (#{used_swap} kB out of #{total_swap} kB) | pct=#{pct_used} used=#{used_swap} total=#{total_swap}"
+	exit WARNING
+else
+	puts "OK - #{pct_used}% swap used (#{used_swap} kB out of #{total_swap} kB) | pct=#{pct_used} used=#{used_swap} total=#{total_swap}"
+	exit OK
+end
+
